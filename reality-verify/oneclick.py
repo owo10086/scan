@@ -4,7 +4,8 @@
 从 VPS 所在 /24 开始扫，合格域名不够就按距离由近到远扫相邻的 /24（逐级翻倍到 /23、/22…），
 只扫和 VPS 同 ASN、同城市的 /24，最远到 --max-prefix（默认 /20，即最多 4096 个地址）。
 """
-import argparse, csv, importlib.util, ipaddress, json, os, re, statistics, subprocess, sys, time, urllib.request
+import argparse, csv, importlib.util, ipaddress, json, os, re, socket, statistics, subprocess, sys, time
+import urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -34,6 +35,10 @@ CONTENT_RISK = re.compile(r"影视|电影|电视剧|动漫|番剧|acg|绅士|成
                           r"\b(porn|xxx|casino|bet|torrent|warez|iptv)\b", re.I)
 GENERIC_TITLES = {"", "home", "index", "welcome", "document", "untitled", "loading", "loading...", "app", "react app",
                   "vite app"}
+WHOIS_REG = re.compile(r"^\s*(creation date|created|created on|registered on|registration time)\s*:\s*(.+)$", re.I | re.M)
+WHOIS_UPD = re.compile(r"^\s*(updated date|last updated|last updated on|changed|last modified|last-update)\s*:\s*(.+)$",
+                       re.I | re.M)
+_whois_servers = {}
 
 
 def log(*a):
@@ -194,6 +199,85 @@ def stability(d, ip):
             "jitter_ms": round(max(ms) - min(ms)) if ms else None}
 
 
+def rdap_servers():
+    """IANA 的 RDAP 引导表：顶级域 → 注册局的 RDAP 地址。"""
+    try:
+        d = http_json("https://data.iana.org/rdap/dns.json")
+    except Exception as e:
+        log(f"  [!] 获取 RDAP 引导表失败：{e}，改用 whois")
+        return {}
+    return {t: next((u for u in urls if u.startswith("https")), urls[0]).rstrip("/") + "/"
+            for tlds, urls in d["services"] for t in tlds}
+
+
+def whois43(server, query):
+    with socket.create_connection((server, 43), timeout=15) as s:
+        s.sendall((query + "\r\n").encode())
+        buf = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                return buf.decode("utf-8", "replace")
+            buf += chunk
+
+
+def whois_server(tld):
+    if tld not in _whois_servers:
+        try:
+            m = re.search(r"^whois:\s*(\S+)", whois43("whois.iana.org", tld), re.M)
+            _whois_servers[tld] = m.group(1) if m else ""
+        except Exception:
+            _whois_servers[tld] = ""
+    return _whois_servers[tld]
+
+
+def ymd(m):
+    if not m:
+        return "?"
+    d = re.search(r"\d{4}-\d{2}-\d{2}", m.group(2))
+    return d.group(0) if d else m.group(2).strip()[:20]
+
+
+def domain_dates(domain, servers):
+    """查域名的注册时间和最近更新时间：先用 RDAP（新版 whois），查不到再用传统 whois（43 端口）。
+    子域名往上一级查（mail.example.com → example.com，a.example.co.uk → example.co.uk）。"""
+    d = domain.lower()
+    if FREE_SUFFIX.search(d):
+        return {"registered": "-", "updated": "-", "whois_src": "免费二级域名，不查"}
+    labels = d.split(".")
+    names = [".".join(labels[-k:]) for k in (3, 2) if len(labels) >= k]
+    tld, errs = labels[-1], []
+    if tld in servers:
+        for name in names:
+            try:
+                j = http_json(servers[tld] + "domain/" + name)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue
+                errs.append(f"RDAP HTTP {e.code}")
+                break
+            except Exception as e:
+                errs.append(f"RDAP {type(e).__name__}")
+                break
+            ev = {e.get("eventAction"): (e.get("eventDate") or "")[:10] for e in j.get("events", [])}
+            return {"registered": ev.get("registration", "?"), "updated": ev.get("last changed", "?"),
+                    "whois_src": f"RDAP {name}"}
+    server = whois_server(tld)
+    for name in names if server else []:
+        try:
+            t = whois43(server, name)
+        except Exception as e:
+            errs.append(f"whois {type(e).__name__}")
+            break
+        if not t.strip():
+            errs.append("whois 空响应（可能被注册局限流）")
+            break
+        reg, upd = WHOIS_REG.search(t), WHOIS_UPD.search(t)
+        if reg or upd:
+            return {"registered": ymd(reg), "updated": ymd(upd), "whois_src": f"whois {name}"}
+    return {"registered": "?", "updated": "?", "whois_src": "；".join(errs) or "查不到"}
+
+
 def common_plen(a, b):
     return 32 - (int(ipaddress.ip_address(a)) ^ int(ipaddress.ip_address(b))).bit_length()
 
@@ -230,7 +314,8 @@ def score(r, vps_ip):
 
 def write_outputs(outdir, info, scanned, skipped, rows, top, n):
     fields = ["rank", "status", "reason", "score", "domain", "scan_ip", "same_net", "dns_ip", "dns_asn", "tls13", "h2",
-              "x25519", "verify_ok", "code", "redirect", "title", "server", "issuer", "cert_days_left", "ok_of_5",
+              "x25519", "verify_ok", "code", "redirect", "title", "server", "issuer", "cert_days_left", "registered",
+              "updated", "whois_src", "ok_of_5",
               "median_ms", "jitter_ms", "notes", "checked_at"]
     with open(f"{outdir}/candidates.csv", "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
@@ -249,19 +334,21 @@ def write_outputs(outdir, info, scanned, skipped, rows, top, n):
           "## 推荐列表", "",
           "下面这些都已实测：DNS 解析回扫描 IP（同 ASN）、TLS 1.3 + h2 + X25519、证书校验通过、首页正常且不跨域跳转、"
           "不走 CDN、不在 Xray 风险名单、连续握手 5 次。", "",
-          "| # | 域名 | IP | 距离 | 分数 | 握手 | 中位数 | 证书 | 首页标题 | 备注 |",
-          "|---|---|---|---|---|---|---|---|---|---|"]
+          "| # | 域名 | IP | 距离 | 分数 | 握手 | 中位数 | 证书 | 域名注册 | 域名更新 | 首页标题 | 备注 |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in top:
         md.append(f"| {r['rank']} | {r['domain']} | {r['scan_ip']} | {r['same_net']} | {r['score']} | {r['ok_of_5']}/5 | "
-                  f"{r['median_ms']}ms | {r['issuer']}，剩 {r['cert_days_left']} 天 | {(r.get('title') or '')[:30]} | "
-                  f"{r['notes'] or '-'} |")
+                  f"{r['median_ms']}ms | {r['issuer']}，剩 {r['cert_days_left']} 天 | {r['registered']} | "
+                  f"{r['updated']} | {(r.get('title') or '')[:30]} | {r['notes'] or '-'} |")
     md += ["", "## 配置（前三名）", ""]
     for r, label in zip(top[:3], ["首选", "第二", "第三"]):
         md += [f"**{label}：{r['domain']}**", "```", f"target: {r['domain']}:443",
                f"serverNames: [\"{r['domain']}\"]", f"client SNI: {r['domain']}", "```", ""]
     md += ["## 说明", "",
            f"- {egress_note(info)[1]}",
-           "- \"同机房\"是根据同 ASN、同前缀推断的；没有做实际 REALITY 连接测试。"]
+           "- \"同机房\"是根据同 ASN、同前缀推断的；没有做实际 REALITY 连接测试。",
+           "- 域名注册/更新时间来自 RDAP 或 whois，子域名显示的是上级域名的；`?` 表示没查到（原因见 candidates.csv 的 "
+           "whois_src 列）。刚注册不久的域名可能是临时站或别人的节点伪装站，慎选。"]
     if not (V.ON_LINUX and info["egress"] == info["ip"]):
         md.append("- 在 VPS 上测真实延迟：`for d in 域名1 域名2; do curl -so /dev/null -w \"$d %{time_appconnect}\\n\" https://$d/; done`")
     md.append("- 全部候选及剔除原因见 candidates.csv。")
@@ -339,12 +426,18 @@ def main():
         else:
             r["status"], r["reason"] = "备选", "合格但排在推荐数量之外"
     top = top[:a.n]
+    log(f"[4/4] 查询 {len(top)} 个推荐域名的注册和更新时间（RDAP / whois）…")
+    servers = rdap_servers()
+    with ThreadPoolExecutor(4) as ex:
+        for r, w in zip(top, ex.map(lambda r: domain_dates(r["domain"], servers), top)):
+            r.update(w)
     write_outputs(outdir, info, scanned, skipped, rows, top, a.n)
 
-    log(f"\n[4/4] 结果（{len(top)} 个）")
+    log(f"\n结果（{len(top)} 个）")
     for r in top:
         log(f"  {r['rank']:>2}. {r['domain']:<36} {r['scan_ip']:<15} {r['same_net']:<6} 分数 {r['score']:<3} "
-            f"握手 {r['ok_of_5']}/5 中位数 {r['median_ms']}ms  {(r.get('title') or '')[:24]}  {r['notes']}")
+            f"握手 {r['ok_of_5']}/5 中位数 {r['median_ms']}ms  注册 {r['registered']} 更新 {r['updated']}  "
+            f"{(r.get('title') or '')[:24]}  {r['notes']}")
     for r, label in zip(top[:3], ["首选", "第二", "第三"]):
         log(f"\n  {label}：\n    target: {r['domain']}:443\n    serverNames: [\"{r['domain']}\"]\n    client SNI: {r['domain']}")
     log(f"\n报告：{outdir}/report.md\n全部候选：{outdir}/candidates.csv")
