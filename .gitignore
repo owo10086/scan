@@ -1,0 +1,9 @@
+# 扫描结果、打包产物、下载或编译的二进制
+scan-*/
+dist/
+xray/
+RealiTLScanner/
+__pycache__/
+.DS_Store
+# 某次扫描专用的导出脚本，里面写死了结果
+reality-verify/export.py
