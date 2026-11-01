@@ -122,7 +122,7 @@ def scan_block(block, outdir, threads):
         subprocess.run([SCANNER, "-addr", str(block), "-thread", str(threads), "-timeout", "5", "-out", path],
                        capture_output=True)
         open(done, "w").write(time.strftime("%F %T"))
-    return list(csv.DictReader(open(path)))
+    return list(csv.DictReader(open(path, encoding="utf-8", errors="replace", newline="")))
 
 
 def prefilter(row):
@@ -236,7 +236,7 @@ def write_outputs(outdir, info, scanned, skipped, rows, top, n):
         w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(sorted(rows, key=lambda r: (r.get("rank") or 999, -(r.get("score") or 0))))
-    json.dump(rows, open(f"{outdir}/results.json", "w"), ensure_ascii=False, indent=1)
+    json.dump(rows, open(f"{outdir}/results.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
     now = time.strftime("%Y-%m-%d %H:%M:%S %Z")
     md = [f"# REALITY 伪装目标扫描报告：{info['ip']}", "",
@@ -265,7 +265,7 @@ def write_outputs(outdir, info, scanned, skipped, rows, top, n):
     if not (V.ON_LINUX and info["egress"] == info["ip"]):
         md.append("- 在 VPS 上测真实延迟：`for d in 域名1 域名2; do curl -so /dev/null -w \"$d %{time_appconnect}\\n\" https://$d/; done`")
     md.append("- 全部候选及剔除原因见 candidates.csv。")
-    open(f"{outdir}/report.md", "w").write("\n".join(md) + "\n")
+    open(f"{outdir}/report.md", "w", encoding="utf-8").write("\n".join(md) + "\n")
 
 
 def main():

@@ -1,18 +1,18 @@
-import json, re, statistics, subprocess, sys, time
+import json, os, re, shutil, statistics, subprocess, sys, time
 
-OPENSSL = "/opt/homebrew/bin/openssl"
+OPENSSL = "/opt/homebrew/bin/openssl" if os.path.exists("/opt/homebrew/bin/openssl") else shutil.which("openssl") or "openssl"
 
 
 def run(cmd, stdin="", timeout=20):
     try:
-        p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, input=stdin, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         return p.stdout + p.stderr
     except subprocess.TimeoutExpired:
         return "TIMEOUT"
 
 
 out = []
-for line in open(sys.argv[1]):
+for line in open(sys.argv[1], encoding="utf-8"):
     d, ip = line.split()
     pem = run([OPENSSL, "s_client", "-connect", f"{ip}:443", "-servername", d], stdin="")
     x = run([OPENSSL, "x509", "-noout", "-issuer", "-enddate", "-ext", "subjectAltName"], stdin=pem)
@@ -33,4 +33,4 @@ for line in open(sys.argv[1]):
          "checked_at": time.strftime("%Y-%m-%d %H:%M:%S %Z")}
     out.append(r)
     print(json.dumps(r, ensure_ascii=False), flush=True)
-json.dump(out, open(sys.argv[2], "w"), ensure_ascii=False, indent=1)
+json.dump(out, open(sys.argv[2], "w", encoding="utf-8"), ensure_ascii=False, indent=1)

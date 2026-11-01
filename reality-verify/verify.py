@@ -21,7 +21,8 @@ _asn_cache = {}
 
 def run(cmd, timeout=20, stdin=""):
     try:
-        p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+        # 证书和网页里可能有非 UTF-8 字节，替换掉，不要让整个流程崩溃
+        p = subprocess.run(cmd, input=stdin, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         return p.stdout + p.stderr
     except subprocess.TimeoutExpired:
         return "TIMEOUT"
@@ -138,12 +139,13 @@ def check(row):
 
 
 def main(scan_csv, out_json):
-    rows = [r for r in csv.DictReader(open(scan_csv)) if r["CERT_DOMAIN"] not in JUNK_CN
+    rows = [r for r in csv.DictReader(open(scan_csv, encoding="utf-8", errors="replace", newline=""))
+            if r["CERT_DOMAIN"] not in JUNK_CN
             and not r["CERT_DOMAIN"].endswith(".fastly.net")]
     print(f"verifying {len(rows)} hosts", file=sys.stderr)
     with ThreadPoolExecutor(4) as ex:
         out = [x for res in ex.map(check, rows) for x in res]
-    json.dump(out, open(out_json, "w"), ensure_ascii=False, indent=1)
+    json.dump(out, open(out_json, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     for r in out:
         print(json.dumps(r, ensure_ascii=False))
 
